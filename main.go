@@ -27,6 +27,8 @@ const (
 	defaultCosmosCont     = "kvcache"
 
 	numKeys = 100
+	// numIterations is how many times the full set of numKeys mutations is repeated.
+	numIterations = 10
 )
 
 func getenv(key, def string) string {
@@ -108,25 +110,30 @@ func main() {
 	log.Printf("using Cosmos %s db=%s container=%s", cosmosEndpoint, cosmosDB, cosmosCont)
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	totalLat := make([]time.Duration, 0, numKeys)
-	commitLat := make([]time.Duration, 0, numKeys)
+	totalLat := make([]time.Duration, 0, numKeys*numIterations)
+	commitLat := make([]time.Duration, 0, numKeys*numIterations)
 
-	log.Printf("mutating %d keys via 6.4 Mutation Algorithm (steps 1-3)...", numKeys)
-	for i := 0; i < numKeys; i++ {
-		key := fmt.Sprintf("app:test:key:%03d", i)
-		val := randValue(r)
+	log.Printf("mutating %d keys x %d iterations via 6.4 Mutation Algorithm (steps 1-3)...", numKeys, numIterations)
+	for iter := 0; iter < numIterations; iter++ {
+		iterStart := time.Now()
+		for i := 0; i < numKeys; i++ {
+			key := fmt.Sprintf("app:test:key:%03d", i)
+			val := randValue(r)
 
-		start := time.Now()
-		commit, err := mutatePut(ctx, amr, container, key, val)
-		total := time.Since(start)
-		if err != nil {
-			log.Fatalf("mutation for %s failed at durable commit: %v", key, err)
+			start := time.Now()
+			commit, err := mutatePut(ctx, amr, container, key, val)
+			total := time.Since(start)
+			if err != nil {
+				log.Fatalf("mutation for %s failed at durable commit: %v", key, err)
+			}
+			totalLat = append(totalLat, total)
+			commitLat = append(commitLat, commit)
+			log.Printf("iter %02d/%02d PUT %s -> %s | commit(cosmos): %v | total: %v", iter+1, numIterations, key, val, commit, total)
 		}
-		totalLat = append(totalLat, total)
-		commitLat = append(commitLat, commit)
-		log.Printf("PUT %s -> %s | commit(cosmos): %v | total: %v", key, val, commit, total)
+		log.Printf("iteration %d/%d complete (%d mutations) in %v", iter+1, numIterations, numKeys, time.Since(iterStart))
 	}
 
+	log.Printf("completed %d mutations (%d keys x %d iterations)", numKeys*numIterations, numKeys, numIterations)
 	printStats("total mutation (steps 1-3)", totalLat)
 	printStats("durable commit (Cosmos upsert)", commitLat)
 }
