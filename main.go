@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
 	"github.com/redis/rueidis"
 )
 
@@ -19,7 +21,12 @@ const (
 	defaultAddr = "amr1-test1.centralus.redis.azure.net:10000"
 	// Entra ID scope for Azure Managed Redis / Azure Cache for Redis.
 	redisScope = "https://redis.azure.com/.default"
-	numKeys    = 100
+
+	defaultCosmosEndpoint = "https://smineyev-kv-cosmos-cus.documents.azure.com:443/"
+	defaultCosmosDB       = "kvdb"
+	defaultCosmosCont     = "kvcache"
+
+	numKeys = 100
 )
 
 func getenv(key, def string) string {
@@ -38,13 +45,22 @@ func randValue(r *rand.Rand) string {
 	return string(b)
 }
 
+// item is the durable document stored in Cosmos DB. The partition key path is
+// "/id", so the id field also serves as the partition key value.
+type item struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
 func main() {
 	addr := getenv("AMR_ADDR", defaultAddr)
-	// The Entra username must be the object ID of the principal.
 	objectID := os.Getenv("AMR_OBJECT_ID")
 	if objectID == "" {
 		log.Fatal("AMR_OBJECT_ID env var is required (Entra object ID of the signed-in principal)")
 	}
+	cosmosEndpoint := getenv("COSMOS_ENDPOINT", defaultCosmosEndpoint)
+	cosmosDB := getenv("COSMOS_DB", defaultCosmosDB)
+	cosmosCont := getenv("COSMOS_CONTAINER", defaultCosmosCont)
 
 	host := addr
 	if i := indexByte(addr, ':'); i >= 0 {
@@ -56,59 +72,98 @@ func main() {
 		log.Fatalf("failed to create Azure credential: %v", err)
 	}
 
-	// Fetch an Entra access token to use as the Redis password.
-	tokenFn := func(ctx context.Context) (string, error) {
-		tk, err := cred.GetToken(ctx, policy.TokenRequestOptions{Scopes: []string{redisScope}})
-		if err != nil {
-			return "", err
-		}
-		return tk.Token, nil
-	}
-
-	client, err := rueidis.NewClient(rueidis.ClientOption{
+	// --- AMR (rueidis) client, authenticated with Entra ID ---
+	amr, err := rueidis.NewClient(rueidis.ClientOption{
 		InitAddress: []string{addr},
 		TLSConfig:   &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12},
 		AuthCredentialsFn: func(ctx rueidis.AuthCredentialsContext) (rueidis.AuthCredentials, error) {
-			token, err := tokenFn(context.Background())
+			tk, err := cred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{redisScope}})
 			if err != nil {
 				return rueidis.AuthCredentials{}, err
 			}
-			return rueidis.AuthCredentials{Username: objectID, Password: token}, nil
+			return rueidis.AuthCredentials{Username: objectID, Password: tk.Token}, nil
 		},
 	})
 	if err != nil {
 		log.Fatalf("failed to create redis client: %v", err)
 	}
-	defer client.Close()
+	defer amr.Close()
+
+	// --- Cosmos DB client, authenticated with Entra ID ---
+	cosmosClient, err := azcosmos.NewClient(cosmosEndpoint, cred, nil)
+	if err != nil {
+		log.Fatalf("failed to create cosmos client: %v", err)
+	}
+	container, err := cosmosClient.NewContainer(cosmosDB, cosmosCont)
+	if err != nil {
+		log.Fatalf("failed to get cosmos container: %v", err)
+	}
 
 	ctx := context.Background()
 
-	// Verify connectivity.
-	if err := client.Do(ctx, client.B().Ping().Build()).Error(); err != nil {
-		log.Fatalf("PING failed: %v", err)
+	if err := amr.Do(ctx, amr.B().Ping().Build()).Error(); err != nil {
+		log.Fatalf("AMR PING failed: %v", err)
 	}
-	log.Printf("connected to %s as %s", addr, objectID)
+	log.Printf("connected to AMR %s as %s", addr, objectID)
+	log.Printf("using Cosmos %s db=%s container=%s", cosmosEndpoint, cosmosDB, cosmosCont)
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	latencies := make([]time.Duration, 0, numKeys)
+	totalLat := make([]time.Duration, 0, numKeys)
+	commitLat := make([]time.Duration, 0, numKeys)
 
-	log.Printf("setting %d keys...", numKeys)
+	log.Printf("mutating %d keys via 6.4 Mutation Algorithm (steps 1-3)...", numKeys)
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("app:test:key:%03d", i)
 		val := randValue(r)
 
 		start := time.Now()
-		err := client.Do(ctx, client.B().Set().Key(key).Value(val).Build()).Error()
-		elapsed := time.Since(start)
-
+		commit, err := mutatePut(ctx, amr, container, key, val)
+		total := time.Since(start)
 		if err != nil {
-			log.Fatalf("SET %s failed: %v", key, err)
+			log.Fatalf("mutation for %s failed at durable commit: %v", key, err)
 		}
-		latencies = append(latencies, elapsed)
-		log.Printf("SET %s -> %s | latency: %v", key, val, elapsed)
+		totalLat = append(totalLat, total)
+		commitLat = append(commitLat, commit)
+		log.Printf("PUT %s -> %s | commit(cosmos): %v | total: %v", key, val, commit, total)
 	}
 
-	printStats(latencies)
+	printStats("total mutation (steps 1-3)", totalLat)
+	printStats("durable commit (Cosmos upsert)", commitLat)
+}
+
+// mutatePut applies the 6.4 Mutation Algorithm for a Put mutation, excluding
+// Step 4 (CDC Reconciliation):
+//
+//	Step 1: Best-Effort AMR Invalidation (log & continue on failure).
+//	Step 2: Commit the Durable Mutation to Cosmos DB (authoritative; must succeed).
+//	Step 3: Opportunistic Cache Update in AMR (log & continue on failure).
+//
+// It returns the Cosmos commit latency and a fatal error only if Step 2 fails.
+func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.ContainerClient, key, val string) (time.Duration, error) {
+	// Step 1: Best-Effort AMR Invalidation.
+	if err := amr.Do(ctx, amr.B().Del().Key(key).Build()).Error(); err != nil {
+		log.Printf("[step1] AMR invalidation failed for %s (continuing): %v", key, err)
+	}
+
+	// Step 2: Commit the Durable Mutation to Cosmos DB.
+	doc := item{ID: key, Value: val}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		return 0, fmt.Errorf("marshal item: %w", err)
+	}
+	pk := azcosmos.NewPartitionKeyString(key)
+	commitStart := time.Now()
+	if _, err := container.UpsertItem(ctx, pk, body, nil); err != nil {
+		return 0, fmt.Errorf("cosmos upsert: %w", err)
+	}
+	commit := time.Since(commitStart)
+
+	// Step 3: Opportunistic Cache Update.
+	if err := amr.Do(ctx, amr.B().Set().Key(key).Value(val).Build()).Error(); err != nil {
+		log.Printf("[step3] AMR cache update failed for %s (continuing): %v", key, err)
+	}
+
+	return commit, nil
 }
 
 func indexByte(s string, b byte) int {
@@ -120,7 +175,7 @@ func indexByte(s string, b byte) int {
 	return -1
 }
 
-func printStats(latencies []time.Duration) {
+func printStats(label string, latencies []time.Duration) {
 	if len(latencies) == 0 {
 		return
 	}
@@ -138,7 +193,7 @@ func printStats(latencies []time.Duration) {
 		return sorted[idx]
 	}
 
-	log.Println("---- latency summary (client-side, SET operations) ----")
+	log.Printf("---- latency summary: %s ----", label)
 	log.Printf("count : %d", len(sorted))
 	log.Printf("min   : %v", sorted[0])
 	log.Printf("avg   : %v", avg)

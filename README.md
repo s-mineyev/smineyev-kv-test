@@ -1,17 +1,31 @@
 # smineyev-kv-test
 
-A small Go test app that connects to an **Azure Managed Redis (AMR)** cluster using the
-[`github.com/redis/rueidis`](https://github.com/redis/rueidis) client, sets 100 predefined
-keys with random values, and logs the client-side latency of each operation.
+A small Go test app that performs 100 key mutations against a KV platform composed of
+**Azure Managed Redis (AMR)** as the cache and **Azure Cosmos DB for NoSQL** as the durable
+source of truth. Each mutation follows the **6.4 Mutation Algorithm** (steps 1–3; CDC
+reconciliation is out of scope) and the app logs client-side latency per operation.
+
+## Mutation Algorithm (section 6.4, steps 1–3)
+
+For every key the app performs a Put mutation:
+
+1. **Best-Effort AMR Invalidation** — `DEL` the key from AMR. On failure, log and continue.
+2. **Commit the Durable Mutation** — upsert the item into Cosmos DB. This is authoritative
+   and must succeed; a failure aborts the mutation.
+3. **Opportunistic Cache Update** — `SET` the committed value in AMR. On failure, log and continue.
+
+Step 4 (CDC Reconciliation) is intentionally **not** implemented.
 
 ## Authentication
 
-The target AMR database has access-key authentication **disabled**, so the app authenticates
-with **Microsoft Entra ID**:
+Both AMR and Cosmos DB authenticate with **Microsoft Entra ID** via `DefaultAzureCredential`
+(no keys/secrets on the host):
 
-- Uses `DefaultAzureCredential` to acquire a token for scope `https://redis.azure.com/.default`.
-- Supplies the token to rueidis via `AuthCredentialsFn`, with the username set to the
-  principal's Entra **object ID** and the password set to the access token.
+- **AMR**: acquires a token for scope `https://redis.azure.com/.default` and supplies it to
+  rueidis via `AuthCredentialsFn`, with the username set to the principal's Entra **object ID**
+  and the password set to the access token (AMR access-key auth is disabled).
+- **Cosmos DB**: the `azcosmos` client uses the same credential. The principal must hold a
+  Cosmos DB data-plane role (e.g. *Cosmos DB Built-in Data Contributor*) on the account.
 
 ## Usage
 
@@ -21,15 +35,20 @@ AMR_OBJECT_ID=<your-entra-object-id> go run .
 
 Environment variables:
 
-| Variable         | Required | Default                                          | Description                                  |
-|------------------|----------|--------------------------------------------------|----------------------------------------------|
-| `AMR_OBJECT_ID`  | yes      | —                                                | Entra object ID of the signed-in principal   |
-| `AMR_ADDR`       | no       | `amr1-test1.centralus.redis.azure.net:10000`     | AMR cluster `host:port`                       |
+| Variable           | Required | Default                                          | Description                                  |
+|--------------------|----------|--------------------------------------------------|----------------------------------------------|
+| `AMR_OBJECT_ID`    | yes      | —                                                | Entra object ID of the signed-in principal   |
+| `AMR_ADDR`         | no       | `amr1-test1.centralus.redis.azure.net:10000`     | AMR cluster `host:port`                       |
+| `COSMOS_ENDPOINT`  | no       | `https://smineyev-kv-cosmos-cus.documents.azure.com:443/` | Cosmos DB account endpoint          |
+| `COSMOS_DB`        | no       | `kvdb`                                            | Cosmos database name                         |
+| `COSMOS_CONTAINER` | no       | `kvcache`                                         | Cosmos container name (partition key `/id`)  |
 
 ## What it does
 
-1. Connects over TLS to the AMR cluster.
-2. Runs `PING` to verify connectivity.
-3. Sets 100 keys (`app:test:key:000` … `app:test:key:099`) with random 16-char values,
-   logging each `SET` latency.
-4. Prints a latency summary (min / avg / p50 / p90 / p99 / max).
+1. Connects over TLS to AMR and creates a Cosmos DB client (both via Entra ID).
+2. Runs `PING` to verify AMR connectivity.
+3. For 100 keys (`app:test:key:000` … `app:test:key:099`), performs a Put mutation
+   following section 6.4 steps 1–3 (invalidate AMR → commit to Cosmos → update AMR),
+   logging the Cosmos commit latency and the total mutation latency.
+4. Prints latency summaries (min / avg / p50 / p90 / p99 / max) for total mutation and
+   durable commit.
