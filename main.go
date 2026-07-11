@@ -28,7 +28,7 @@ const (
 
 	numKeys = 100
 	// numIterations is how many times the full set of numKeys mutations is repeated.
-	numIterations = 10
+	numIterations = 4
 )
 
 func getenv(key, def string) string {
