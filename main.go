@@ -87,6 +87,7 @@ type config struct {
 	cosmosDB       string
 	cosmosCont     string
 	ttlSeconds     int32
+	keyPrefix      string
 }
 
 // sessionResult carries the latencies collected by a single session.
@@ -100,6 +101,7 @@ type sessionResult struct {
 func main() {
 	sessions := flag.Int("sessions", defaultSessions, "number of concurrent sessions")
 	ttl := flag.Int("ttl", 3600, "per-item TTL in seconds (drives expire_at and Cosmos physical cleanup)")
+	keyPrefix := flag.String("keyprefix", "app:test", "key namespace prefix; keys are <prefix>:s<NN>:key:<KKK>")
 	flag.Parse()
 	numSessions := *sessions
 	if numSessions < 1 {
@@ -113,6 +115,7 @@ func main() {
 		cosmosDB:       getenv("COSMOS_DB", defaultCosmosDB),
 		cosmosCont:     getenv("COSMOS_CONTAINER", defaultCosmosCont),
 		ttlSeconds:     int32(*ttl),
+		keyPrefix:      *keyPrefix,
 	}
 	if cfg.objectID == "" {
 		log.Fatal("AMR_OBJECT_ID env var is required (Entra object ID of the signed-in principal)")
@@ -207,10 +210,10 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 	commitLat := make([]time.Duration, 0, keysPerSession*numIterations)
 	rus := make([]float64, 0, keysPerSession*numIterations)
 
-	log.Printf("session %d started (keys app:test:s%02d:key:000-%03d)", sessionID, sessionID, keysPerSession-1)
+	log.Printf("session %d started (keys %s:s%02d:key:000-%03d)", sessionID, cfg.keyPrefix, sessionID, keysPerSession-1)
 	for iter := 0; iter < numIterations; iter++ {
 		for k := 0; k < keysPerSession; k++ {
-			key := fmt.Sprintf("app:test:s%02d:key:%03d", sessionID, k)
+			key := fmt.Sprintf("%s:s%02d:key:%03d", cfg.keyPrefix, sessionID, k)
 			val := randValue(r)
 
 			start := time.Now()
