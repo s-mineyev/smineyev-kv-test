@@ -175,17 +175,17 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 		return sessionResult{err: fmt.Errorf("AMR PING: %w", err)}
 	}
 
-	// Each session owns a distinct, non-overlapping block of keys.
-	firstKey := sessionID * keysPerSession
+	// Each session owns its own key namespace, keyed by the session number so
+	// keys are guaranteed unique per session regardless of key count.
 	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(sessionID)))
 
 	totalLat := make([]time.Duration, 0, keysPerSession*numIterations)
 	commitLat := make([]time.Duration, 0, keysPerSession*numIterations)
 
-	log.Printf("session %d started (keys %03d-%03d)", sessionID, firstKey, firstKey+keysPerSession-1)
+	log.Printf("session %d started (keys app:test:s%02d:key:000-%03d)", sessionID, sessionID, keysPerSession-1)
 	for iter := 0; iter < numIterations; iter++ {
 		for k := 0; k < keysPerSession; k++ {
-			key := fmt.Sprintf("app:test:key:%03d", firstKey+k)
+			key := fmt.Sprintf("app:test:s%02d:key:%03d", sessionID, k)
 			val := randValue(r)
 
 			start := time.Now()

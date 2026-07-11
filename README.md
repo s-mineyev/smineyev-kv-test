@@ -47,8 +47,9 @@ Environment variables:
 
 1. Launches **N concurrent sessions** (goroutines; `-sessions N`, default `1`), each with
    its own AMR and Cosmos DB client (both via Entra ID), and runs `PING` to verify AMR.
-2. Each session owns a distinct block of **20 keys** (session _s_ owns
-   `app:test:key:(s*20)` … `app:test:key:(s*20+19)`).
+2. Each session owns its own key namespace, keyed by session number
+   (session _s_ uses `app:test:s<ss>:key:000` … `app:test:s<ss>:key:019`), so keys are
+   unique per session.
 3. Each session repeats over **4 iterations**, performing a Put mutation per key following
    section 6.4 steps 1–3 (invalidate AMR → commit to Cosmos → update AMR). This yields
    N × 4 × 20 mutations total.
