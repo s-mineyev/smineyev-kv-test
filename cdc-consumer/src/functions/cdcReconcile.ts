@@ -70,10 +70,10 @@ export async function cdcReconcile(documents: unknown[], context: InvocationCont
         const commitLagMs = parsed.commitTsSec !== undefined ? nowMs - parsed.commitTsSec * 1000 : undefined;
 
         if (lagMs !== undefined) {
-            trackLag('cdc_lag_ms', lagMs, { op: parsed.op, action });
+            trackLag(context, 'cdc_lag_ms', lagMs, { op: parsed.op, action });
         }
         if (commitLagMs !== undefined) {
-            trackLag('cdc_commit_lag_ms', commitLagMs, { op: parsed.op, action });
+            trackLag(context, 'cdc_commit_lag_ms', commitLagMs, { op: parsed.op, action });
         }
 
         context.log(JSON.stringify({

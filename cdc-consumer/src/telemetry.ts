@@ -1,25 +1,15 @@
-import { TelemetryClient } from 'applicationinsights';
+// Lag and metric reporting. To keep the deployment package small (the
+// applicationinsights npm package pulls in ~180 MB of OpenTelemetry), we do NOT
+// use the App Insights SDK. Instead we emit metrics as structured log lines,
+// which the Functions host forwards to Application Insights automatically. They
+// can be aggregated in Kusto by parsing the JSON `metric`/`value` fields.
+import { InvocationContext } from '@azure/functions';
 
-// A standalone TelemetryClient (not appInsights.setup(), which would conflict
-// with the Functions host's auto-instrumentation) used only to emit custom
-// metrics such as cdc_lag_ms. No-ops when no connection string is configured.
-let client: TelemetryClient | undefined;
-let initialized = false;
-
-function getClient(): TelemetryClient | undefined {
-    if (!initialized) {
-        initialized = true;
-        const conn = process.env.APPLICATIONINSIGHTS_CONNECTION_STRING;
-        if (conn) {
-            client = new TelemetryClient(conn);
-        }
-    }
-    return client;
-}
-
-export function trackLag(name: string, value: number, properties?: Record<string, string>): void {
-    const c = getClient();
-    if (c) {
-        c.trackMetric({ name, value, properties });
-    }
+export function trackLag(
+    context: InvocationContext,
+    name: string,
+    value: number,
+    properties?: Record<string, string>
+): void {
+    context.log(JSON.stringify({ evt: 'metric', metric: name, value, ...(properties ?? {}) }));
 }

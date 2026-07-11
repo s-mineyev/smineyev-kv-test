@@ -29,6 +29,12 @@ AMR_PORT="${AMR_PORT:-10000}"
 
 FUNC_APP="${FUNC_APP:-smineyev-kv-cdc-cus}"
 APP_INSIGHTS="${APP_INSIGHTS:-smineyev-kv-cdc-ai}"
+# App Service plan for the function. A CDC reconciliation consumer must run
+# continuously (own the change-feed leases and keep converging the cache), so
+# we host it on a Basic Linux plan with Always On rather than a scale-to-zero
+# Consumption/Flex plan (where the trigger listener would not stay alive).
+PLAN="${PLAN:-smineyev-kv-cdc-plan}"
+PLAN_SKU="${PLAN_SKU:-B1}"
 # Storage account names are global + <=24 lowercase alphanumerics.
 STORAGE="${STORAGE:-kvcdc$(openssl rand -hex 4)sa}"
 
@@ -37,9 +43,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 az config set extension.use_dynamic_install=yes_without_prompt >/dev/null 2>&1 || true
 SUB_ID="$(az account show --query id -o tsv)"
 
-echo "== ensuring Microsoft.Insights + Web providers registered =="
+echo "== ensuring resource providers registered =="
 az provider register --namespace Microsoft.Insights >/dev/null 2>&1 || true
 az provider register --namespace Microsoft.Web >/dev/null 2>&1 || true
+az provider register --namespace microsoft.operationalinsights >/dev/null 2>&1 || true
 
 echo "== pre-creating leases container (avoids needing control-plane rights for the MI) =="
 az cosmosdb sql container create \
@@ -60,15 +67,27 @@ az monitor app-insights component create \
   --kind web --only-show-errors -o none
 AI_CONN="$(az monitor app-insights component show --app "$APP_INSIGHTS" --resource-group "$RG" --query connectionString -o tsv)"
 
-echo "== creating Flex Consumption Function App: $FUNC_APP =="
+echo "== creating Linux App Service plan: $PLAN ($PLAN_SKU) =="
+az appservice plan create \
+  --name "$PLAN" --resource-group "$RG" --location "$LOCATION" \
+  --is-linux --sku "$PLAN_SKU" \
+  --only-show-errors -o none
+
+echo "== creating Function App (always-on): $FUNC_APP =="
 az functionapp create \
   --name "$FUNC_APP" --resource-group "$RG" \
   --storage-account "$STORAGE" \
-  --flexconsumption-location "$LOCATION" \
-  --runtime node --runtime-version 20 \
+  --plan "$PLAN" \
+  --runtime node --runtime-version 24 \
+  --functions-version 4 \
   --assign-identity '[system]' \
   --app-insights "$APP_INSIGHTS" \
   --only-show-errors -o none
+
+echo "== enabling Always On (keeps the change-feed listener running) =="
+az functionapp config set \
+  --name "$FUNC_APP" --resource-group "$RG" \
+  --always-on true --only-show-errors -o none
 
 MI_OID="$(az functionapp identity show --name "$FUNC_APP" --resource-group "$RG" --query principalId -o tsv)"
 echo "   function managed identity object id: $MI_OID"
@@ -106,13 +125,15 @@ npm install --no-fund --no-audit
 npm run build
 # Wait for role/setting propagation before the app cold-starts.
 sleep 30
+# .funcignore excludes typescript/@types/core-tools and *.ts from the package,
+# so only the compiled dist/ + runtime deps are shipped.
 func azure functionapp publish "$FUNC_APP" --typescript
 popd >/dev/null
 
 echo ""
 echo "=============================================================="
 echo " Deployment complete."
-echo " Function App : $FUNC_APP  (Flex Consumption, $LOCATION)"
+echo " Function App : $FUNC_APP  ($PLAN_SKU App Service plan, Always On, $LOCATION)"
 echo " Identity OID : $MI_OID"
 echo " App Insights : $APP_INSIGHTS"
 echo ""

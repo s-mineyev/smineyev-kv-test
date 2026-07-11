@@ -15,7 +15,6 @@
     "@azure/functions": "^4.0.0",
     "@azure/identity": "^4.13.1",
     "@redis/entraid": "^6.1.0",
-    "applicationinsights": "^3.15.1",
     "redis": "^6.1.0"
   },
   "devDependencies": {
