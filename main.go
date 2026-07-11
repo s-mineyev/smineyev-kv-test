@@ -75,6 +75,7 @@ type config struct {
 type sessionResult struct {
 	totalLat  []time.Duration
 	commitLat []time.Duration
+	rus       []float64
 	err       error
 }
 
@@ -127,17 +128,20 @@ func main() {
 
 	// Aggregate results across all sessions.
 	var allTotal, allCommit []time.Duration
+	var allRU []float64
 	for s := 0; s < numSessions; s++ {
 		if results[s].err != nil {
 			log.Fatalf("session %d failed: %v", s, results[s].err)
 		}
 		allTotal = append(allTotal, results[s].totalLat...)
 		allCommit = append(allCommit, results[s].commitLat...)
+		allRU = append(allRU, results[s].rus...)
 	}
 
 	log.Printf("all sessions complete: %d mutations in %v (wall clock)", len(allTotal), elapsed)
 	printStats("total mutation (steps 1-3), all sessions", allTotal)
 	printStats("durable commit (Cosmos upsert), all sessions", allCommit)
+	printRUStats("Cosmos RU charge per upsert, all sessions", allRU, elapsed)
 }
 
 // runSession opens its own AMR and Cosmos clients (an independent "session")
@@ -181,6 +185,7 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 
 	totalLat := make([]time.Duration, 0, keysPerSession*numIterations)
 	commitLat := make([]time.Duration, 0, keysPerSession*numIterations)
+	rus := make([]float64, 0, keysPerSession*numIterations)
 
 	log.Printf("session %d started (keys app:test:s%02d:key:000-%03d)", sessionID, sessionID, keysPerSession-1)
 	for iter := 0; iter < numIterations; iter++ {
@@ -189,18 +194,19 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 			val := randValue(r)
 
 			start := time.Now()
-			commit, err := mutatePut(ctx, amr, container, key, val)
+			commit, ru, err := mutatePut(ctx, amr, container, key, val)
 			total := time.Since(start)
 			if err != nil {
 				return sessionResult{err: fmt.Errorf("mutation for %s: %w", key, err)}
 			}
 			totalLat = append(totalLat, total)
 			commitLat = append(commitLat, commit)
+			rus = append(rus, float64(ru))
 		}
 	}
 	log.Printf("session %d complete (%d mutations)", sessionID, len(totalLat))
 
-	return sessionResult{totalLat: totalLat, commitLat: commitLat}
+	return sessionResult{totalLat: totalLat, commitLat: commitLat, rus: rus}
 }
 
 // mutatePut applies the 6.4 Mutation Algorithm for a Put mutation, excluding
@@ -210,8 +216,9 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 //	Step 2: Commit the Durable Mutation to Cosmos DB (authoritative; must succeed).
 //	Step 3: Opportunistic Cache Update in AMR (log & continue on failure).
 //
-// It returns the Cosmos commit latency and a fatal error only if Step 2 fails.
-func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.ContainerClient, key, val string) (time.Duration, error) {
+// It returns the Cosmos commit latency, the RU charge for the upsert, and a
+// fatal error only if Step 2 fails.
+func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.ContainerClient, key, val string) (time.Duration, float32, error) {
 	// Step 1: Best-Effort AMR Invalidation.
 	if err := amr.Do(ctx, amr.B().Del().Key(key).Build()).Error(); err != nil {
 		log.Printf("[step1] AMR invalidation failed for %s (continuing): %v", key, err)
@@ -221,21 +228,23 @@ func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.Cont
 	doc := item{ID: key, Value: val}
 	body, err := json.Marshal(doc)
 	if err != nil {
-		return 0, fmt.Errorf("marshal item: %w", err)
+		return 0, 0, fmt.Errorf("marshal item: %w", err)
 	}
 	pk := azcosmos.NewPartitionKeyString(key)
 	commitStart := time.Now()
-	if _, err := container.UpsertItem(ctx, pk, body, nil); err != nil {
-		return 0, fmt.Errorf("cosmos upsert: %w", err)
+	resp, err := container.UpsertItem(ctx, pk, body, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("cosmos upsert: %w", err)
 	}
 	commit := time.Since(commitStart)
+	ru := resp.RequestCharge
 
 	// Step 3: Opportunistic Cache Update.
 	if err := amr.Do(ctx, amr.B().Set().Key(key).Value(val).Build()).Error(); err != nil {
 		log.Printf("[step3] AMR cache update failed for %s (continuing): %v", key, err)
 	}
 
-	return commit, nil
+	return commit, ru, nil
 }
 
 func indexByte(s string, b byte) int {
@@ -273,4 +282,36 @@ func printStats(label string, latencies []time.Duration) {
 	log.Printf("p90   : %v", pct(0.90))
 	log.Printf("p99   : %v", pct(0.99))
 	log.Printf("max   : %v", sorted[len(sorted)-1])
+}
+
+// printRUStats reports the per-request RU charge distribution (from the Cosmos
+// x-ms-request-charge response header) plus total and effective RU/s consumed.
+func printRUStats(label string, rus []float64, elapsed time.Duration) {
+	if len(rus) == 0 {
+		return
+	}
+	sorted := make([]float64, len(rus))
+	copy(sorted, rus)
+	sort.Float64s(sorted)
+
+	var sum float64
+	for _, v := range sorted {
+		sum += v
+	}
+	avg := sum / float64(len(sorted))
+	pct := func(p float64) float64 {
+		idx := int(p * float64(len(sorted)-1))
+		return sorted[idx]
+	}
+	effectiveRUps := sum / elapsed.Seconds()
+
+	log.Printf("---- RU summary: %s ----", label)
+	log.Printf("count       : %d", len(sorted))
+	log.Printf("min RU      : %.2f", sorted[0])
+	log.Printf("avg RU      : %.2f", avg)
+	log.Printf("p50 RU      : %.2f", pct(0.50))
+	log.Printf("p99 RU      : %.2f", pct(0.99))
+	log.Printf("max RU      : %.2f", sorted[len(sorted)-1])
+	log.Printf("total RU    : %.2f", sum)
+	log.Printf("effective RU/s : %.2f (over %v wall clock)", effectiveRUps, elapsed)
 }
