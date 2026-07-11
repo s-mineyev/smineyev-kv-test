@@ -9,8 +9,10 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/azcosmos"
@@ -26,8 +28,11 @@ const (
 	defaultCosmosDB       = "kvdb"
 	defaultCosmosCont     = "kvcache"
 
-	numKeys = 100
-	// numIterations is how many times the full set of numKeys mutations is repeated.
+	// numSessions concurrent sessions run in parallel, each with its own AMR
+	// and Cosmos DB client and its own distinct block of keysPerSession keys.
+	numSessions    = 5
+	keysPerSession = 20
+	// numIterations is how many times each session repeats its block of keys.
 	numIterations = 4
 )
 
@@ -54,88 +59,139 @@ type item struct {
 	Value string `json:"value"`
 }
 
+// config holds the shared connection settings resolved from the environment.
+type config struct {
+	addr           string
+	host           string
+	objectID       string
+	cosmosEndpoint string
+	cosmosDB       string
+	cosmosCont     string
+}
+
+// sessionResult carries the latencies collected by a single session.
+type sessionResult struct {
+	totalLat  []time.Duration
+	commitLat []time.Duration
+	err       error
+}
+
 func main() {
-	addr := getenv("AMR_ADDR", defaultAddr)
-	objectID := os.Getenv("AMR_OBJECT_ID")
-	if objectID == "" {
+	cfg := config{
+		addr:           getenv("AMR_ADDR", defaultAddr),
+		objectID:       os.Getenv("AMR_OBJECT_ID"),
+		cosmosEndpoint: getenv("COSMOS_ENDPOINT", defaultCosmosEndpoint),
+		cosmosDB:       getenv("COSMOS_DB", defaultCosmosDB),
+		cosmosCont:     getenv("COSMOS_CONTAINER", defaultCosmosCont),
+	}
+	if cfg.objectID == "" {
 		log.Fatal("AMR_OBJECT_ID env var is required (Entra object ID of the signed-in principal)")
 	}
-	cosmosEndpoint := getenv("COSMOS_ENDPOINT", defaultCosmosEndpoint)
-	cosmosDB := getenv("COSMOS_DB", defaultCosmosDB)
-	cosmosCont := getenv("COSMOS_CONTAINER", defaultCosmosCont)
-
-	host := addr
-	if i := indexByte(addr, ':'); i >= 0 {
-		host = addr[:i]
+	cfg.host = cfg.addr
+	if i := indexByte(cfg.addr, ':'); i >= 0 {
+		cfg.host = cfg.addr[:i]
 	}
 
+	// A single credential is shared by all sessions; azidentity credentials
+	// are safe for concurrent use and cache tokens internally.
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		log.Fatalf("failed to create Azure credential: %v", err)
 	}
 
-	// --- AMR (rueidis) client, authenticated with Entra ID ---
+	log.Printf("launching %d concurrent sessions x %d iterations x %d keys (%d mutations total)",
+		numSessions, numIterations, keysPerSession, numSessions*numIterations*keysPerSession)
+	log.Printf("AMR %s | Cosmos %s db=%s container=%s", cfg.addr, cfg.cosmosEndpoint, cfg.cosmosDB, cfg.cosmosCont)
+
+	results := make([]sessionResult, numSessions)
+	var wg sync.WaitGroup
+	overallStart := time.Now()
+	for s := 0; s < numSessions; s++ {
+		wg.Add(1)
+		go func(sessionID int) {
+			defer wg.Done()
+			results[sessionID] = runSession(cred, cfg, sessionID)
+		}(s)
+	}
+	wg.Wait()
+	elapsed := time.Since(overallStart)
+
+	// Aggregate results across all sessions.
+	var allTotal, allCommit []time.Duration
+	for s := 0; s < numSessions; s++ {
+		if results[s].err != nil {
+			log.Fatalf("session %d failed: %v", s, results[s].err)
+		}
+		allTotal = append(allTotal, results[s].totalLat...)
+		allCommit = append(allCommit, results[s].commitLat...)
+	}
+
+	log.Printf("all sessions complete: %d mutations in %v (wall clock)", len(allTotal), elapsed)
+	printStats("total mutation (steps 1-3), all sessions", allTotal)
+	printStats("durable commit (Cosmos upsert), all sessions", allCommit)
+}
+
+// runSession opens its own AMR and Cosmos clients (an independent "session")
+// and applies numIterations rounds of the 6.4 Mutation Algorithm over its own
+// distinct block of keysPerSession keys.
+func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionResult {
+	ctx := context.Background()
+
 	amr, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress: []string{addr},
-		TLSConfig:   &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12},
+		InitAddress: []string{cfg.addr},
+		TLSConfig:   &tls.Config{ServerName: cfg.host, MinVersion: tls.VersionTLS12},
 		AuthCredentialsFn: func(ctx rueidis.AuthCredentialsContext) (rueidis.AuthCredentials, error) {
 			tk, err := cred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{redisScope}})
 			if err != nil {
 				return rueidis.AuthCredentials{}, err
 			}
-			return rueidis.AuthCredentials{Username: objectID, Password: tk.Token}, nil
+			return rueidis.AuthCredentials{Username: cfg.objectID, Password: tk.Token}, nil
 		},
 	})
 	if err != nil {
-		log.Fatalf("failed to create redis client: %v", err)
+		return sessionResult{err: fmt.Errorf("create redis client: %w", err)}
 	}
 	defer amr.Close()
 
-	// --- Cosmos DB client, authenticated with Entra ID ---
-	cosmosClient, err := azcosmos.NewClient(cosmosEndpoint, cred, nil)
+	cosmosClient, err := azcosmos.NewClient(cfg.cosmosEndpoint, cred, nil)
 	if err != nil {
-		log.Fatalf("failed to create cosmos client: %v", err)
+		return sessionResult{err: fmt.Errorf("create cosmos client: %w", err)}
 	}
-	container, err := cosmosClient.NewContainer(cosmosDB, cosmosCont)
+	container, err := cosmosClient.NewContainer(cfg.cosmosDB, cfg.cosmosCont)
 	if err != nil {
-		log.Fatalf("failed to get cosmos container: %v", err)
+		return sessionResult{err: fmt.Errorf("get cosmos container: %w", err)}
 	}
-
-	ctx := context.Background()
 
 	if err := amr.Do(ctx, amr.B().Ping().Build()).Error(); err != nil {
-		log.Fatalf("AMR PING failed: %v", err)
+		return sessionResult{err: fmt.Errorf("AMR PING: %w", err)}
 	}
-	log.Printf("connected to AMR %s as %s", addr, objectID)
-	log.Printf("using Cosmos %s db=%s container=%s", cosmosEndpoint, cosmosDB, cosmosCont)
 
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	totalLat := make([]time.Duration, 0, numKeys*numIterations)
-	commitLat := make([]time.Duration, 0, numKeys*numIterations)
+	// Each session owns a distinct, non-overlapping block of keys.
+	firstKey := sessionID * keysPerSession
+	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(sessionID)))
 
-	log.Printf("mutating %d keys x %d iterations via 6.4 Mutation Algorithm (steps 1-3)...", numKeys, numIterations)
+	totalLat := make([]time.Duration, 0, keysPerSession*numIterations)
+	commitLat := make([]time.Duration, 0, keysPerSession*numIterations)
+
+	log.Printf("session %d started (keys %03d-%03d)", sessionID, firstKey, firstKey+keysPerSession-1)
 	for iter := 0; iter < numIterations; iter++ {
-		iterStart := time.Now()
-		for i := 0; i < numKeys; i++ {
-			key := fmt.Sprintf("app:test:key:%03d", i)
+		for k := 0; k < keysPerSession; k++ {
+			key := fmt.Sprintf("app:test:key:%03d", firstKey+k)
 			val := randValue(r)
 
 			start := time.Now()
 			commit, err := mutatePut(ctx, amr, container, key, val)
 			total := time.Since(start)
 			if err != nil {
-				log.Fatalf("mutation for %s failed at durable commit: %v", key, err)
+				return sessionResult{err: fmt.Errorf("mutation for %s: %w", key, err)}
 			}
 			totalLat = append(totalLat, total)
 			commitLat = append(commitLat, commit)
-			log.Printf("iter %02d/%02d PUT %s -> %s | commit(cosmos): %v | total: %v", iter+1, numIterations, key, val, commit, total)
 		}
-		log.Printf("iteration %d/%d complete (%d mutations) in %v", iter+1, numIterations, numKeys, time.Since(iterStart))
 	}
+	log.Printf("session %d complete (%d mutations)", sessionID, len(totalLat))
 
-	log.Printf("completed %d mutations (%d keys x %d iterations)", numKeys*numIterations, numKeys, numIterations)
-	printStats("total mutation (steps 1-3)", totalLat)
-	printStats("durable commit (Cosmos upsert)", commitLat)
+	return sessionResult{totalLat: totalLat, commitLat: commitLat}
 }
 
 // mutatePut applies the 6.4 Mutation Algorithm for a Put mutation, excluding

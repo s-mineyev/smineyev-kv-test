@@ -45,11 +45,12 @@ Environment variables:
 
 ## What it does
 
-1. Connects over TLS to AMR and creates a Cosmos DB client (both via Entra ID).
-2. Runs `PING` to verify AMR connectivity.
-3. For 100 keys (`app:test:key:000` … `app:test:key:099`), repeated over 4 iterations
-   (400 mutations total), performs a Put mutation following section 6.4 steps 1–3
-   (invalidate AMR → commit to Cosmos → update AMR), logging the Cosmos commit latency
-   and the total mutation latency.
+1. Launches **5 concurrent sessions** (goroutines), each with its own AMR and Cosmos DB
+   client (both via Entra ID), and runs `PING` to verify AMR connectivity.
+2. Each session owns a distinct block of **20 keys** (session _s_ owns
+   `app:test:key:(s*20)` … `app:test:key:(s*20+19)`).
+3. Each session repeats over **4 iterations**, performing a Put mutation per key following
+   section 6.4 steps 1–3 (invalidate AMR → commit to Cosmos → update AMR). This yields
+   5 × 4 × 20 = **400 mutations** total.
 4. Prints latency summaries (min / avg / p50 / p90 / p99 / max) aggregated across all
-   iterations, for total mutation and durable commit.
+   sessions, for total mutation and durable commit.
