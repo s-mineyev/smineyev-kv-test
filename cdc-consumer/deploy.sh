@@ -35,8 +35,10 @@ APP_INSIGHTS="${APP_INSIGHTS:-smineyev-kv-cdc-ai}"
 # Consumption/Flex plan (where the trigger listener would not stay alive).
 PLAN="${PLAN:-smineyev-kv-cdc-plan}"
 PLAN_SKU="${PLAN_SKU:-B1}"
-# Storage account names are global + <=24 lowercase alphanumerics.
-STORAGE="${STORAGE:-kvcdc$(openssl rand -hex 4)sa}"
+# Storage account names are global + <=24 lowercase alphanumerics. Use a stable
+# (deterministic) name so re-running this script reuses the same account instead
+# of leaking a new one each time.
+STORAGE="${STORAGE:-smineyevkvcdcsa}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
