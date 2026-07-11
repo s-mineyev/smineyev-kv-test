@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"math/rand"
@@ -30,8 +31,9 @@ const (
 
 	// numSessions concurrent sessions run in parallel, each with its own AMR
 	// and Cosmos DB client and its own distinct block of keysPerSession keys.
-	numSessions    = 5
-	keysPerSession = 20
+	// It is configurable via the -sessions flag (default 1).
+	defaultSessions = 1
+	keysPerSession  = 20
 	// numIterations is how many times each session repeats its block of keys.
 	numIterations = 4
 )
@@ -77,6 +79,13 @@ type sessionResult struct {
 }
 
 func main() {
+	sessions := flag.Int("sessions", defaultSessions, "number of concurrent sessions")
+	flag.Parse()
+	numSessions := *sessions
+	if numSessions < 1 {
+		log.Fatalf("-sessions must be >= 1, got %d", numSessions)
+	}
+
 	cfg := config{
 		addr:           getenv("AMR_ADDR", defaultAddr),
 		objectID:       os.Getenv("AMR_OBJECT_ID"),
