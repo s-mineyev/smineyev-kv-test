@@ -1,0 +1,26 @@
+{
+  "name": "cdc-consumer",
+  "version": "1.0.0",
+  "description": "CDC reconciliation consumer (doc 6.4 step 4): Cosmos DB change feed -> AMR",
+  "main": "dist/src/functions/*.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "clean": "rimraf dist",
+    "prestart": "npm run clean && npm run build",
+    "start": "func start",
+    "test": "echo \"No tests yet...\""
+  },
+  "dependencies": {
+    "@azure/functions": "^4.0.0",
+    "@azure/identity": "^4.13.1",
+    "@redis/entraid": "^6.1.0",
+    "applicationinsights": "^3.15.1",
+    "redis": "^6.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "18.x",
+    "rimraf": "^5.0.0",
+    "typescript": "^5.0.0"
+  }
+}
