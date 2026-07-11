@@ -102,6 +102,7 @@ func main() {
 	sessions := flag.Int("sessions", defaultSessions, "number of concurrent sessions")
 	ttl := flag.Int("ttl", 3600, "per-item TTL in seconds (drives expire_at and Cosmos physical cleanup)")
 	keyPrefix := flag.String("keyprefix", "app:test", "key namespace prefix; keys are <prefix>:s<NN>:key:<KKK>")
+	cdcLag := flag.Bool("cdclag", false, "CDC-lag mode: write only to Cosmos (bypass AMR), then poll AMR to measure change-feed reconciliation lag")
 	flag.Parse()
 	numSessions := *sessions
 	if numSessions < 1 {
@@ -135,6 +136,11 @@ func main() {
 	log.Printf("launching %d concurrent sessions x %d iterations x %d keys (%d mutations total)",
 		numSessions, numIterations, keysPerSession, numSessions*numIterations*keysPerSession)
 	log.Printf("AMR %s | Cosmos %s db=%s container=%s", cfg.addr, cfg.cosmosEndpoint, cfg.cosmosDB, cfg.cosmosCont)
+
+	if *cdcLag {
+		runCdcLagTest(cred, cfg, numSessions)
+		return
+	}
 
 	results := make([]sessionResult, numSessions)
 	var wg sync.WaitGroup
@@ -284,6 +290,115 @@ func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.Cont
 	}
 
 	return commit, ru, nil
+}
+
+// runCdcLagTest measures CDC reconciliation lag under numSessions concurrent
+// writers. Each session writes its keys *directly to Cosmos only* (bypassing the
+// AMR invalidate/update steps), then polls AMR until the change-feed consumer
+// has reconciled each key. Because the client never writes AMR itself, the
+// observed AMR arrival is attributable solely to CDC. lag = AMR-seen - Cosmos-commit.
+func runCdcLagTest(cred azcore.TokenCredential, cfg config, numSessions int) {
+	log.Printf("CDC-lag mode: %d concurrent session(s) x %d keys, writing Cosmos-only then polling AMR", numSessions, keysPerSession)
+
+	lagCh := make(chan time.Duration, numSessions*keysPerSession)
+	missCh := make(chan int, numSessions)
+	var wg sync.WaitGroup
+	for s := 0; s < numSessions; s++ {
+		wg.Add(1)
+		go func(sessionID int) {
+			defer wg.Done()
+			misses := cdcLagSession(cred, cfg, sessionID, lagCh)
+			missCh <- misses
+		}(s)
+	}
+	wg.Wait()
+	close(lagCh)
+	close(missCh)
+
+	lags := make([]time.Duration, 0, numSessions*keysPerSession)
+	for l := range lagCh {
+		lags = append(lags, l)
+	}
+	misses := 0
+	for m := range missCh {
+		misses += m
+	}
+	log.Printf("CDC-lag: %d reconciled, %d not seen within timeout", len(lags), misses)
+	printStats("CDC reconciliation lag", lags)
+}
+
+// cdcLagSession writes keysPerSession keys to Cosmos only, then polls AMR for
+// each until reconciled by CDC, sending per-key lag on lagCh. Returns the count
+// of keys not reconciled within the timeout.
+func cdcLagSession(cred azcore.TokenCredential, cfg config, sessionID int, lagCh chan<- time.Duration) int {
+	ctx := context.Background()
+	amr, err := rueidis.NewClient(rueidis.ClientOption{
+		InitAddress: []string{cfg.addr},
+		TLSConfig:   &tls.Config{ServerName: cfg.host, MinVersion: tls.VersionTLS12},
+		AuthCredentialsFn: func(rueidis.AuthCredentialsContext) (rueidis.AuthCredentials, error) {
+			tk, err := cred.GetToken(context.Background(), policy.TokenRequestOptions{Scopes: []string{redisScope}})
+			if err != nil {
+				return rueidis.AuthCredentials{}, err
+			}
+			return rueidis.AuthCredentials{Username: cfg.objectID, Password: tk.Token}, nil
+		},
+	})
+	if err != nil {
+		log.Fatalf("session %d: create redis client: %v", sessionID, err)
+	}
+	defer amr.Close()
+
+	cosmosClient, err := azcosmos.NewClient(cfg.cosmosEndpoint, cred, nil)
+	if err != nil {
+		log.Fatalf("session %d: create cosmos client: %v", sessionID, err)
+	}
+	container, err := cosmosClient.NewContainer(cfg.cosmosDB, cfg.cosmosCont)
+	if err != nil {
+		log.Fatalf("session %d: get cosmos container: %v", sessionID, err)
+	}
+
+	r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(sessionID)))
+	type pending struct {
+		val string
+		t0  time.Time
+	}
+	pend := make(map[string]pending, keysPerSession)
+
+	// Phase 1: write each key directly to Cosmos (no AMR), pre-clearing AMR so a
+	// stale value can't be mistaken for a CDC reconciliation.
+	for k := 0; k < keysPerSession; k++ {
+		key := fmt.Sprintf("%s:s%02d:key:%03d", cfg.keyPrefix, sessionID, k)
+		val := randValue(r)
+		_ = amr.Do(ctx, amr.B().Del().Key(key).Build()).Error()
+
+		nowMs := time.Now().UnixMilli()
+		doc := item{ID: key, Value: val, ExpireAt: nowMs + int64(cfg.ttlSeconds)*1000, WrittenAtMs: nowMs, TTL: cfg.ttlSeconds}
+		body, _ := json.Marshal(doc)
+		if _, err := container.UpsertItem(ctx, azcosmos.NewPartitionKeyString(key), body, nil); err != nil {
+			log.Fatalf("session %d: cosmos upsert %s: %v", sessionID, key, err)
+		}
+		pend[key] = pending{val: val, t0: time.Now()}
+	}
+
+	// Phase 2: poll AMR until each key is reconciled by CDC (or times out).
+	const timeout = 60 * time.Second
+	deadline := time.Now().Add(timeout)
+	for len(pend) > 0 && time.Now().Before(deadline) {
+		for key, p := range pend {
+			got, err := amr.Do(ctx, amr.B().Get().Key(key).Build()).ToString()
+			if err == nil && got != "" {
+				var ce cacheEntry
+				if json.Unmarshal([]byte(got), &ce) == nil && ce.Value == p.val {
+					lagCh <- time.Since(p.t0)
+					delete(pend, key)
+				}
+			}
+		}
+		if len(pend) > 0 {
+			time.Sleep(150 * time.Millisecond)
+		}
+	}
+	return len(pend)
 }
 
 func indexByte(s string, b byte) int {
