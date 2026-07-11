@@ -12,9 +12,22 @@ For every key the app performs a Put mutation:
 1. **Best-Effort AMR Invalidation** — `DEL` the key from AMR. On failure, log and continue.
 2. **Commit the Durable Mutation** — upsert the item into Cosmos DB. This is authoritative
    and must succeed; a failure aborts the mutation.
-3. **Opportunistic Cache Update** — `SET` the committed value in AMR. On failure, log and continue.
+3. **Opportunistic Cache Update** — `SET` the committed value in AMR as a JSON
+   `{value, expire_at}` entry with a Redis expiry at `expire_at`. On failure, log and continue.
 
-Step 4 (CDC Reconciliation) is intentionally **not** implemented.
+Step 4 (CDC Reconciliation) is implemented separately by the TypeScript Azure Function in
+[`cdc-consumer/`](cdc-consumer/).
+
+## Data model
+
+Each Cosmos document is `{id, value, expire_at, written_at_ms, ttl}`:
+
+- `expire_at` — absolute unix-ms; controls visibility and is the generation discriminator for
+  expiration/recreation races (doc 6.6/6.7).
+- `ttl` — relative seconds (from `-ttl`, default 3600); drives Cosmos physical cleanup.
+- `written_at_ms` — client commit timestamp, used by the CDC consumer to measure stream lag.
+
+The AMR value mirrors `{value, expire_at}` so the cache carries the generation for reconciliation.
 
 ## Authentication
 
@@ -56,4 +69,4 @@ Environment variables:
 4. Prints latency summaries (min / avg / p50 / p90 / p99 / max) aggregated across all
    sessions, for total mutation and durable commit.
 
-Run with, e.g., `./kvtest -sessions 5` (defaults to a single session).
+Run with, e.g., `./kvtest -sessions 5 -ttl 3600` (defaults to a single session, 1h TTL).

@@ -56,9 +56,26 @@ func randValue(r *rand.Rand) string {
 
 // item is the durable document stored in Cosmos DB. The partition key path is
 // "/id", so the id field also serves as the partition key value.
+//
+// Per doc 6.6/6.7, ExpireAt (absolute unix-ms) controls visibility and acts as
+// the generation discriminator for expiration/recreation races. TTL (relative
+// seconds) drives Cosmos physical cleanup. WrittenAtMs is the client commit
+// timestamp used by the CDC consumer to measure end-to-end stream lag.
 type item struct {
-	ID    string `json:"id"`
-	Value string `json:"value"`
+	ID          string `json:"id"`
+	Value       string `json:"value"`
+	ExpireAt    int64  `json:"expire_at"`
+	WrittenAtMs int64  `json:"written_at_ms"`
+	TTL         int32  `json:"ttl"`
+}
+
+// cacheEntry is the JSON value stored in AMR for a key. It carries expire_at so
+// both the CDC consumer (doc 6.7 generation compare) and the read path (6.3
+// expire_at validation) can reason about it. The Go app and the TypeScript CDC
+// consumer must keep this shape in sync.
+type cacheEntry struct {
+	Value    string `json:"value"`
+	ExpireAt int64  `json:"expire_at"`
 }
 
 // config holds the shared connection settings resolved from the environment.
@@ -69,6 +86,7 @@ type config struct {
 	cosmosEndpoint string
 	cosmosDB       string
 	cosmosCont     string
+	ttlSeconds     int32
 }
 
 // sessionResult carries the latencies collected by a single session.
@@ -81,6 +99,7 @@ type sessionResult struct {
 
 func main() {
 	sessions := flag.Int("sessions", defaultSessions, "number of concurrent sessions")
+	ttl := flag.Int("ttl", 3600, "per-item TTL in seconds (drives expire_at and Cosmos physical cleanup)")
 	flag.Parse()
 	numSessions := *sessions
 	if numSessions < 1 {
@@ -93,6 +112,7 @@ func main() {
 		cosmosEndpoint: getenv("COSMOS_ENDPOINT", defaultCosmosEndpoint),
 		cosmosDB:       getenv("COSMOS_DB", defaultCosmosDB),
 		cosmosCont:     getenv("COSMOS_CONTAINER", defaultCosmosCont),
+		ttlSeconds:     int32(*ttl),
 	}
 	if cfg.objectID == "" {
 		log.Fatal("AMR_OBJECT_ID env var is required (Entra object ID of the signed-in principal)")
@@ -194,7 +214,7 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 			val := randValue(r)
 
 			start := time.Now()
-			commit, ru, err := mutatePut(ctx, amr, container, key, val)
+			commit, ru, err := mutatePut(ctx, amr, container, key, val, cfg.ttlSeconds)
 			total := time.Since(start)
 			if err != nil {
 				return sessionResult{err: fmt.Errorf("mutation for %s: %w", key, err)}
@@ -218,14 +238,23 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 //
 // It returns the Cosmos commit latency, the RU charge for the upsert, and a
 // fatal error only if Step 2 fails.
-func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.ContainerClient, key, val string) (time.Duration, float32, error) {
+func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.ContainerClient, key, val string, ttlSeconds int32) (time.Duration, float32, error) {
 	// Step 1: Best-Effort AMR Invalidation.
 	if err := amr.Do(ctx, amr.B().Del().Key(key).Build()).Error(); err != nil {
 		log.Printf("[step1] AMR invalidation failed for %s (continuing): %v", key, err)
 	}
 
 	// Step 2: Commit the Durable Mutation to Cosmos DB.
-	doc := item{ID: key, Value: val}
+	// expire_at (absolute) controls visibility/generation; ttl (relative) drives
+	// Cosmos physical cleanup; written_at_ms lets the CDC consumer measure lag.
+	nowMs := time.Now().UnixMilli()
+	doc := item{
+		ID:          key,
+		Value:       val,
+		ExpireAt:    nowMs + int64(ttlSeconds)*1000,
+		WrittenAtMs: nowMs,
+		TTL:         ttlSeconds,
+	}
 	body, err := json.Marshal(doc)
 	if err != nil {
 		return 0, 0, fmt.Errorf("marshal item: %w", err)
@@ -239,9 +268,16 @@ func mutatePut(ctx context.Context, amr rueidis.Client, container *azcosmos.Cont
 	commit := time.Since(commitStart)
 	ru := resp.RequestCharge
 
-	// Step 3: Opportunistic Cache Update.
-	if err := amr.Do(ctx, amr.B().Set().Key(key).Value(val).Build()).Error(); err != nil {
-		log.Printf("[step3] AMR cache update failed for %s (continuing): %v", key, err)
+	// Step 3: Opportunistic Cache Update. Store {value, expire_at} so the CDC
+	// consumer and read path can compare generations (doc 6.7), and set the
+	// Redis key to auto-expire at expire_at.
+	cacheBody, err := json.Marshal(cacheEntry{Value: val, ExpireAt: doc.ExpireAt})
+	if err == nil {
+		if err := amr.Do(ctx, amr.B().Set().Key(key).Value(string(cacheBody)).ExatTimestamp(doc.ExpireAt/1000).Build()).Error(); err != nil {
+			log.Printf("[step3] AMR cache update failed for %s (continuing): %v", key, err)
+		}
+	} else {
+		log.Printf("[step3] marshal cache entry failed for %s (continuing): %v", key, err)
 	}
 
 	return commit, ru, nil
