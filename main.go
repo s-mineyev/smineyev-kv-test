@@ -45,9 +45,9 @@ func getenv(key, def string) string {
 	return def
 }
 
-func randValue(r *rand.Rand) string {
+func randValue(r *rand.Rand, size int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 16)
+	b := make([]byte, size)
 	for i := range b {
 		b[i] = charset[r.Intn(len(charset))]
 	}
@@ -88,6 +88,7 @@ type config struct {
 	cosmosCont     string
 	ttlSeconds     int32
 	keyPrefix      string
+	valueSize      int
 }
 
 // sessionResult carries the latencies collected by a single session.
@@ -103,6 +104,7 @@ func main() {
 	ttl := flag.Int("ttl", 3600, "per-item TTL in seconds (drives expire_at and Cosmos physical cleanup)")
 	keyPrefix := flag.String("keyprefix", "app:test", "key namespace prefix; keys are <prefix>:s<NN>:key:<KKK>")
 	cdcLag := flag.Bool("cdclag", false, "CDC-lag mode: write only to Cosmos (bypass AMR), then poll AMR to measure change-feed reconciliation lag")
+	valueSize := flag.Int("valuesize", 16, "size in bytes of the random value payload")
 	flag.Parse()
 	numSessions := *sessions
 	if numSessions < 1 {
@@ -117,6 +119,7 @@ func main() {
 		cosmosCont:     getenv("COSMOS_CONTAINER", defaultCosmosCont),
 		ttlSeconds:     int32(*ttl),
 		keyPrefix:      *keyPrefix,
+		valueSize:      *valueSize,
 	}
 	if cfg.objectID == "" {
 		log.Fatal("AMR_OBJECT_ID env var is required (Entra object ID of the signed-in principal)")
@@ -220,7 +223,7 @@ func runSession(cred azcore.TokenCredential, cfg config, sessionID int) sessionR
 	for iter := 0; iter < numIterations; iter++ {
 		for k := 0; k < keysPerSession; k++ {
 			key := fmt.Sprintf("%s:s%02d:key:%03d", cfg.keyPrefix, sessionID, k)
-			val := randValue(r)
+			val := randValue(r, cfg.valueSize)
 
 			start := time.Now()
 			commit, ru, err := mutatePut(ctx, amr, container, key, val, cfg.ttlSeconds)
@@ -368,7 +371,7 @@ func cdcLagSession(cred azcore.TokenCredential, cfg config, sessionID int, lagCh
 	// stale value can't be mistaken for a CDC reconciliation.
 	for k := 0; k < keysPerSession; k++ {
 		key := fmt.Sprintf("%s:s%02d:key:%03d", cfg.keyPrefix, sessionID, k)
-		val := randValue(r)
+		val := randValue(r, cfg.valueSize)
 		_ = amr.Do(ctx, amr.B().Del().Key(key).Build()).Error()
 
 		nowMs := time.Now().UnixMilli()
