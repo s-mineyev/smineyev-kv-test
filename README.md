@@ -1,9 +1,10 @@
 # smineyev-kv-test
 
-A small Go test app that performs 100 key mutations against a KV platform composed of
+A small Go test app that performs key mutations against a KV platform composed of
 **Azure Managed Redis (AMR)** as the cache and **Azure Cosmos DB for NoSQL** as the durable
-source of truth. Each mutation follows the **6.4 Mutation Algorithm** (steps 1–3; CDC
-reconciliation is out of scope) and the app logs client-side latency per operation.
+source of truth. Each mutation follows the **6.4 Mutation Algorithm** (steps 1–3) and the app
+logs client-side latency per operation. Step 4 (CDC Reconciliation) is implemented by the
+TypeScript Azure Function in [`cdc-consumer/`](cdc-consumer/).
 
 ## Mutation Algorithm (section 6.4, steps 1–3)
 
