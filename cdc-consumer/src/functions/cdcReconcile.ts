@@ -21,6 +21,8 @@ interface FullFidelityChange {
         operationType?: 'create' | 'replace' | 'delete';
         crts?: number; // commit timestamp (seconds)
         timeToLiveExpired?: boolean;
+        id?: string;
+        partitionKey?: { id?: string };
     };
 }
 
@@ -59,7 +61,7 @@ export async function cdcReconcile(documents: unknown[], context: InvocationCont
         const nowMs = Date.now();
         let action: ReconcileAction;
         try {
-            action = await reconcile(client, parsed.key, parsed.op, parsed.eventExpireAt, parsed.value, nowMs);
+            action = await reconcile(client, parsed.key, parsed.op, parsed.eventExpireAt, parsed.value, nowMs, parsed.ttlExpired);
         } catch (err) {
             context.error(JSON.stringify({ evt: 'cdc_reconcile_error', key: parsed.key, op: parsed.op, error: `${(err as Error)?.message ?? err}` }));
             throw err; // let the trigger retry the batch
@@ -111,8 +113,11 @@ function parseChange(raw: unknown): ParsedEvent | undefined {
         const ttlExpired = ff.metadata.timeToLiveExpired === true;
 
         if (opType === 'delete') {
-            const doc = ff.previous ?? ff.current ?? {};
-            const key = doc.id ?? ff.current?.id;
+            // For deletes in full-fidelity mode, `current` is empty and the key
+            // lives in metadata.id (or metadata.partitionKey.id). `previous`
+            // carries the last committed body when available.
+            const doc = ff.previous ?? {};
+            const key = ff.metadata.id ?? ff.metadata.partitionKey?.id ?? doc.id;
             if (!key) {
                 return undefined;
             }
