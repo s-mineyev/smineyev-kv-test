@@ -35,7 +35,7 @@ const (
 	defaultSessions = 1
 	keysPerSession  = 20
 	// numIterations is how many times each session repeats its block of keys.
-	numIterations = 4
+	numIterations = 1000
 )
 
 func getenv(key, def string) string {
