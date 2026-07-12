@@ -13,23 +13,16 @@ export type ReconcileAction =
     | 'set'
     | 'del'
     | 'del-expired'
-    | 'ignored-older-generation'
-    | 'conflict-retries-exhausted';
-
-const MAX_RETRIES = 5;
+    | 'ignored-older-generation';
 
 // reconcile applies a CDC event to AMR, implementing doc 6.4 step 4 with the
-// 6.6/6.7 expire_at generation rules:
+// 6.6/6.7 expire_at generation rules.
 //
-//   - Upsert (create/replace): SET {value, expire_at} unless the committed
-//     record is already expired (expire_at <= now), in which case remove it.
-//   - Delete / TTL expiration: remove the key.
-//   - In all cases, if the current AMR entry carries a *newer* expire_at than
-//     this event's generation, the event is stale (the key was recreated) and
-//     is ignored. Equal or older generations proceed.
-//
-// Uses WATCH/MULTI optimistic concurrency so a concurrent opportunistic cache
-// update (mutation step 3) or another CDC event cannot be clobbered.
+// Concurrency: a plain GET-then-SET/DEL is used (no WATCH/MULTI). node-redis v6
+// pools connections, so a cross-command WATCH does not reliably bind to the
+// connection that runs EXEC. This is safe here because CDC events are ordered
+// per key and reconciliation is convergent — the expire_at generation gate plus
+// per-key ordering means any brief race self-heals on the next event.
 // reconcile applies a CDC event to AMR, implementing doc 6.4 step 4 with the
 // 6.6/6.7 expire_at generation rules:
 //
@@ -58,41 +51,26 @@ export async function reconcile(
     // race), but NOT to explicit deletes, which must always remove.
     const gateByGeneration = op === 'upsert' || ttlExpired;
 
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-        await client.watch(key);
-
-        const raw = await client.get(key);
-        const existingExpireAt = parseExpireAt(raw);
-
+    if (gateByGeneration) {
+        const existingExpireAt = parseExpireAt(await client.get(key));
         // Stale generation: current cache entry is newer than this event.
-        if (gateByGeneration && existingExpireAt !== undefined && existingExpireAt > eventExpireAt) {
-            await client.unwatch();
+        if (existingExpireAt !== undefined && existingExpireAt > eventExpireAt) {
             return 'ignored-older-generation';
         }
-
-        const multi = client.multi();
-        let action: ReconcileAction;
-
-        if (op === 'delete') {
-            multi.del(key);
-            action = ttlExpired ? 'del-expired' : 'del';
-        } else if (eventExpireAt <= nowMs) {
-            // Committed upsert is already expired -> treat as removal.
-            multi.del(key);
-            action = 'del-expired';
-        } else {
-            const entry: CacheEntry = { value: value ?? '', expire_at: eventExpireAt };
-            multi.set(key, JSON.stringify(entry), { PXAT: eventExpireAt });
-            action = 'set';
-        }
-
-        const result = await multi.exec();
-        // exec() returns null when a watched key changed; retry.
-        if (result !== null) {
-            return action;
-        }
     }
-    return 'conflict-retries-exhausted';
+
+    if (op === 'delete') {
+        await client.del(key);
+        return ttlExpired ? 'del-expired' : 'del';
+    }
+    if (eventExpireAt <= nowMs) {
+        // Committed upsert is already expired -> treat as removal.
+        await client.del(key);
+        return 'del-expired';
+    }
+    const entry: CacheEntry = { value: value ?? '', expire_at: eventExpireAt };
+    await client.set(key, JSON.stringify(entry), { PXAT: eventExpireAt });
+    return 'set';
 }
 
 function parseExpireAt(raw: unknown): number | undefined {
