@@ -36,7 +36,7 @@ Both Cosmos DB and AMR use the Function App's **system-assigned managed identity
 
 All Versions and Deletes mode requires, on the Cosmos account:
 
-- **Continuous backup (PITR)** enabled (already set on `smineyev-kv-cosmos-cus`).
+- **Continuous backup (PITR)** enabled on the Cosmos account.
 - **`enableAllVersionsAndDeletesChangeFeed = true`** at the account level (set via ARM PATCH).
 - Do **not** set a container `changeFeedPolicy.retentionDuration` when continuous backup is
   enabled — retention is governed by the backup retention, and setting it is rejected.

@@ -19,6 +19,23 @@ For every key the app performs a Put mutation:
 Step 4 (CDC Reconciliation) is implemented separately by the TypeScript Azure Function in
 [`cdc-consumer/`](cdc-consumer/).
 
+## Infrastructure
+
+The full Azure stack is reproducible from two scripts:
+
+- **[`provision.sh`](provision.sh)** — stands up everything in one shot: resource group, AMR
+  cluster (Entra-ID auth), a **serverless** Cosmos DB for NoSQL account (continuous backup +
+  "All Versions and Deletes" change feed) with the `kvcache` (no-index, TTL) and `leases`
+  containers, an Ubuntu test VM (ephemeral OS disk, managed identity, Go + repo bootstrapped),
+  data-plane role grants, and the CDC function (via `cdc-consumer/deploy.sh`). Region defaults to
+  Central US. Note: the account-level change-feed flag and AMR creation each take ~10–20 min.
+- **[`teardown.sh`](teardown.sh)** — deletes the whole resource group.
+
+```bash
+./provision.sh            # create everything
+./teardown.sh --yes       # delete everything
+```
+
 ## Data model
 
 Each Cosmos document is `{id, value, expire_at, written_at_ms, ttl}`:
@@ -53,7 +70,7 @@ Environment variables:
 |--------------------|----------|--------------------------------------------------|----------------------------------------------|
 | `AMR_OBJECT_ID`    | yes      | —                                                | Entra object ID of the signed-in principal   |
 | `AMR_ADDR`         | no       | `amr1-test1.centralus.redis.azure.net:10000`     | AMR cluster `host:port`                       |
-| `COSMOS_ENDPOINT`  | no       | `https://smineyev-kv-cosmos-cus.documents.azure.com:443/` | Cosmos DB account endpoint          |
+| `COSMOS_ENDPOINT`  | no       | `https://smineyev-kv-cosmos-sl.documents.azure.com:443/` | Cosmos DB account endpoint          |
 | `COSMOS_DB`        | no       | `kvdb`                                            | Cosmos database name                         |
 | `COSMOS_CONTAINER` | no       | `kvcache`                                         | Cosmos container name (partition key `/id`)  |
 

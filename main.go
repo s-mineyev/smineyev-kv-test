@@ -25,7 +25,7 @@ const (
 	// Entra ID scope for Azure Managed Redis / Azure Cache for Redis.
 	redisScope = "https://redis.azure.com/.default"
 
-	defaultCosmosEndpoint = "https://smineyev-kv-cosmos-cus.documents.azure.com:443/"
+	defaultCosmosEndpoint = "https://smineyev-kv-cosmos-sl.documents.azure.com:443/"
 	defaultCosmosDB       = "kvdb"
 	defaultCosmosCont     = "kvcache"
 

@@ -18,7 +18,7 @@ set -euo pipefail
 RG="${RG:-test1}"
 LOCATION="${LOCATION:-centralus}"
 
-COSMOS_ACCOUNT="${COSMOS_ACCOUNT:-smineyev-kv-cosmos-cus}"
+COSMOS_ACCOUNT="${COSMOS_ACCOUNT:-smineyev-kv-cosmos-sl}"
 COSMOS_DB="${COSMOS_DB:-kvdb}"
 COSMOS_CONTAINER="${COSMOS_CONTAINER:-kvcache}"
 LEASE_CONTAINER="${LEASE_CONTAINER:-leases}"
